@@ -12,6 +12,7 @@ const char* view_mode_name(ViewMode m) {
         case ViewMode::Normals: return "normals";
         case ViewMode::Depth: return "depth";
         case ViewMode::UV: return "uv";
+        case ViewMode::Mips: return "mips";
         default: return "?";
     }
 }
@@ -175,16 +176,17 @@ const Vec3 kSkyHorizon{0.36f, 0.39f, 0.45f};
 struct LitShader : SurfaceVertexShader {
     const Texture* albedo = nullptr;
     bool use_texture = true;
+    TextureFilter filter = TextureFilter::Anisotropic;
     Vec3 eye, light_dir, sun_color{2.3f, 2.15f, 1.9f};
     float shininess = 48.0f, specular = 0.35f;
     ShadowLookup shadow;
 
-    bool fragment(const Surface& in, Vec3& out) const {
+    bool fragment(const Surface& in, const Derivatives<Surface>& d, Vec3& out) const {
         Vec3 n = normalize(in.normal);
         Vec3 v = normalize(eye - in.world);
         if (dot(n, v) < 0) n = -n;  // shade back faces of open meshes sensibly
 
-        Vec3 base = use_texture ? albedo->sample_bilinear(in.uv) : Vec3(0.7f);
+        Vec3 base = use_texture ? albedo->sample(in.uv, d.ddx.uv, d.ddy.uv, filter) : Vec3(0.7f);
         float n_dot_l = std::max(dot(n, light_dir), 0.0f);
         float vis = n_dot_l > 0 ? shadow.visibility(in.world, n_dot_l) : 0.0f;
 
@@ -225,11 +227,34 @@ struct DepthShader : SurfaceVertexShader {
     }
 };
 
+// UV gradient with tile borders drawn as anti-aliased lines of constant 1.5 px
+// width, using derivatives the same way GLSL's fwidth() would.
 struct UVShader : SurfaceVertexShader {
-    bool fragment(const Surface& in, Vec3& out) const {
+    bool fragment(const Surface& in, const Derivatives<Surface>& d, Vec3& out) const {
         float u = fract(in.uv.x), v = fract(in.uv.y);
-        float line = std::min({u, 1.0f - u, v, 1.0f - v}) < 0.02f ? 0.6f : 1.0f;
+        float fu = std::abs(d.ddx.uv.x) + std::abs(d.ddy.uv.x), fv = std::abs(d.ddx.uv.y) + std::abs(d.ddy.uv.y);
+        float du = std::min(u, 1.0f - u) / std::max(fu, 1e-6f), dv = std::min(v, 1.0f - v) / std::max(fv, 1e-6f);
+        float line = 1.0f - 0.55f * (1.0f - smoothstep(0.0f, 1.5f, std::min(du, dv)));
         out = display(Vec3(u, v, 0.25f) * line);
+        return true;
+    }
+};
+
+// Colors each pixel by the mip level trilinear filtering would pick:
+// blue = full resolution, then cyan, green, yellow, orange, red, magenta as it shrinks.
+struct MipShader : SurfaceVertexShader {
+    const Texture* albedo = nullptr;
+    bool fragment(const Surface& in, const Derivatives<Surface>& d, Vec3& out) const {
+        static const Vec3 palette[] = {{0.15f, 0.35f, 1.0f}, {0.1f, 0.85f, 0.95f}, {0.2f, 0.9f, 0.3f},
+                                       {0.95f, 0.9f, 0.2f},  {1.0f, 0.55f, 0.1f},  {0.95f, 0.15f, 0.1f},
+                                       {0.85f, 0.2f, 0.9f}};
+        constexpr int n = int(sizeof(palette) / sizeof(palette[0]));
+        float lod = std::clamp(albedo->lod(d.ddx.uv, d.ddy.uv), 0.0f, float(n - 1));
+        int i = std::min(int(lod), n - 2);
+        Vec3 tint = lerp(palette[i], palette[i + 1], lod - float(i));
+        Vec3 tex = albedo->sample(in.uv, d.ddx.uv, d.ddy.uv, TextureFilter::Trilinear);
+        float lum = std::clamp(dot(tex, Vec3(0.3f, 0.6f, 0.1f)) * 2.0f, 0.0f, 1.0f);
+        out = display(tint * (0.55f + 0.45f * lum));
         return true;
     }
 };
@@ -299,6 +324,7 @@ FrameStats Renderer::render(Framebuffer& fb, const Scene& scene, const OrbitCame
             s.eye = cam.eye();
             s.light_dir = light_dir;
             s.use_texture = rs.textures;
+            s.filter = rs.filter;
             if (shadows) s.shadow = {&shadow_map_, light_vp};
             draw_both(s, &scene.model_texture);
             break;
@@ -311,6 +337,7 @@ FrameStats Renderer::render(Framebuffer& fb, const Scene& scene, const OrbitCame
             draw_both(s, nullptr);
             break;
         }
+        case ViewMode::Mips: draw_both(MipShader{}, &scene.model_texture); break;
         default: draw_both(UVShader{}, nullptr); break;
     }
     stats.main_ms = ms_since(t0);

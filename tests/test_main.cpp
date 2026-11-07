@@ -9,6 +9,7 @@
 #include "sr/mesh.hpp"
 #include "sr/png.hpp"
 #include "sr/rasterizer.hpp"
+#include "sr/texture.hpp"
 
 using namespace sr;
 
@@ -127,6 +128,62 @@ static void test_png() {
     CHECK(data.size() > 12 && data.substr(data.size() - 8) == std::string("IEND\xAE\x42\x60\x82", 8), "bad IEND chunk");
 }
 
+// Varying = screen-linear UV ramp. Under an orthographic (w = 1) projection the
+// derivatives are exact constants, so every pixel must report the same ddx / ddy.
+struct DerivativeShader {
+    struct Varying {
+        float u, v;
+        Varying operator+(const Varying& o) const { return {u + o.u, v + o.v}; }
+        Varying operator*(float s) const { return {u * s, v * s}; }
+    };
+    struct Result { std::atomic<int> count{0}, bad{0}; };
+    Result* result;
+    Vec4 vertex(const Vec2& p, Varying& out) const {
+        out = {p.x * 3.0f, p.y * 5.0f};  // u grows to the right, v grows upward
+        return {p.x, p.y, 0.0f, 1.0f};
+    }
+    bool fragment(const Varying&, const Derivatives<Varying>& d, Vec3& color) const {
+        // One pixel step in NDC is 2/W horizontally and -2/H vertically (y is down on screen).
+        const float W = 128, H = 96;
+        bool ok = std::abs(d.ddx.u - 3.0f * 2.0f / W) < 1e-4f && std::abs(d.ddx.v) < 1e-4f &&
+                  std::abs(d.ddy.v + 5.0f * 2.0f / H) < 1e-4f && std::abs(d.ddy.u) < 1e-4f;
+        result->count++;
+        if (!ok) result->bad++;
+        color = Vec3(1.0f);
+        return true;
+    }
+};
+
+static void test_derivatives() {
+    // A single small triangle: most quads along its edges contain helper lanes,
+    // so this also checks that extrapolated helpers produce correct derivatives.
+    std::vector<Vec2> verts = {{-0.6f, -0.7f}, {0.8f, -0.2f}, {-0.1f, 0.9f}};
+    std::vector<uint32_t> idx = {0, 1, 2};
+    Framebuffer fb(128, 96);
+    DerivativeShader::Result result;
+    draw(fb, DerivativeShader{&result}, std::span<const Vec2>(verts), std::span<const uint32_t>(idx));
+    CHECK(result.count > 1000, "triangle should cover many pixels, got %d", result.count.load());
+    CHECK(result.bad == 0, "%d of %d fragments had wrong derivatives", result.bad.load(), result.count.load());
+}
+
+static void test_mipmaps() {
+    Texture t = Texture::generate(16, 8, [](float u, float) { return Vec3(u < 0.5f ? 1.0f : 0.0f); });
+    CHECK(t.mip_count() == 5, "16x8 should have 5 levels (16x8 .. 1x1), got %d", t.mip_count());
+    CHECK(t.level_width(4) == 1 && t.level_height(4) == 1, "last level should be 1x1");
+    CHECK(std::abs(t.at(0, 0, 4).x - 0.5f) < 1e-6f, "1x1 level should be the average, got %f", t.at(0, 0, 4).x);
+
+    // LOD = log2(footprint in level-0 texels); the longer axis wins.
+    Texture sq(64, 64);
+    CHECK(std::abs(sq.lod({1.0f / 64, 0}, {0, 1.0f / 64})) < 1e-5f, "1 texel per pixel -> lod 0");
+    CHECK(std::abs(sq.lod({4.0f / 64, 0}, {0, 1.0f / 64}) - 2.0f) < 1e-5f, "4 texels per pixel -> lod 2");
+    CHECK(std::abs(sq.lod({0, 0}, {0, 16.0f / 64}) - 4.0f) < 1e-5f, "16 texels per pixel -> lod 4");
+
+    // A footprint covering the whole texture must return its average color, for every filter
+    // except nearest/bilinear (which ignore the footprint).
+    Vec3 tri = t.sample({0.3f, 0.5f}, {1.0f, 0}, {0, 1.0f}, TextureFilter::Trilinear);
+    CHECK(std::abs(tri.x - 0.5f) < 1e-5f, "trilinear at the top level should be 0.5, got %f", tri.x);
+}
+
 int main() {
     std::printf("watertight rasterization\n");
     test_watertight(64, 64, 8, 1);
@@ -135,6 +192,10 @@ int main() {
     test_watertight(97, 53, 13, 4);
     std::printf("backface culling\n");
     test_backface_culling();
+    std::printf("quad derivatives\n");
+    test_derivatives();
+    std::printf("mipmaps\n");
+    test_mipmaps();
     std::printf("OBJ loader\n");
     test_obj_loader();
     std::printf("PNG writer\n");

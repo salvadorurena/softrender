@@ -12,7 +12,7 @@
 
 namespace sr {
 
-enum class ViewMode { Shaded, Normals, Depth, UV, Count };
+enum class ViewMode { Shaded, Normals, Depth, UV, Mips, Count };
 const char* view_mode_name(ViewMode m);
 bool parse_view_mode(const std::string& s, ViewMode& out);
 
@@ -34,6 +34,7 @@ struct RenderSettings {
     bool wireframe = false;
     bool shadows = true;
     bool textures = true;
+    TextureFilter filter = TextureFilter::Anisotropic;
     float light_yaw = radians(-40.0f);
     float light_pitch = radians(55.0f);
     float model_spin = 0.0f;  // radians around Y

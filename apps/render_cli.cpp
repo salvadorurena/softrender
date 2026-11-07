@@ -18,7 +18,8 @@ static void usage() {
         "  --out PATH          output PNG (default: render.png)\n"
         "  --size WxH          image size (default: 1280x720)\n"
         "  --ssaa N            supersample N x N and downsample (default: 1)\n"
-        "  --mode MODE         shaded | normals | depth | uv (default: shaded)\n"
+        "  --mode MODE         shaded | normals | depth | uv | mips (default: shaded)\n"
+        "  --filter F          nearest | bilinear | trilinear | aniso (default: aniso)\n"
         "  --wireframe         overlay front-facing edges\n"
         "  --no-shadows        disable the shadow-map pass\n"
         "  --no-textures       untextured shading\n"
@@ -59,6 +60,12 @@ int main(int argc, char** argv) {
         } else if (a == "--wireframe") rs.wireframe = true;
         else if (a == "--no-shadows") rs.shadows = false;
         else if (a == "--no-textures") rs.textures = false;
+        else if (a == "--filter") {
+            if (!parse_texture_filter(next(), rs.filter)) {
+                std::fprintf(stderr, "unknown filter: %s\n", argv[i]);
+                return 2;
+            }
+        }
         else if (a == "--yaw") cam.yaw = radians(std::strtof(next(), nullptr));
         else if (a == "--pitch") cam.pitch = radians(std::strtof(next(), nullptr));
         else if (a == "--distance") cam.distance = std::strtof(next(), nullptr);
@@ -100,8 +107,8 @@ int main(int argc, char** argv) {
             wire += s.wire_ms;
         }
         double total = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-        std::printf("%dx%d, %s, %u threads, %zu model triangles, %d frames\n", fb.width(), fb.height(),
-                    view_mode_name(rs.mode), worker_count(), s.model.triangles_in, bench);
+        std::printf("%dx%d, %s, %s filtering, %u threads, %zu model triangles, %d frames\n", fb.width(),
+                    fb.height(), view_mode_name(rs.mode), texture_filter_name(rs.filter), worker_count(), s.model.triangles_in, bench);
         std::printf("  avg frame  %7.2f ms  (%.1f fps)\n", total / bench, 1000.0 * bench / total);
         std::printf("  shadow     %7.2f ms\n  main       %7.2f ms\n", shadow / bench, main / bench);
         if (rs.wireframe) std::printf("  wireframe  %7.2f ms\n", wire / bench);

@@ -2,7 +2,8 @@
 //
 //   vertex shader -> primitive assembly -> homogeneous clipping -> perspective divide
 //   -> viewport + backface culling -> fixed-point edge-function rasterization
-//   -> perspective-correct interpolation -> early depth test -> fragment shader
+//   -> 2x2 quads -> early depth test -> perspective-correct interpolation + derivatives
+//   -> fragment shader
 //
 // A shader is any type that looks like:
 //
@@ -13,10 +14,15 @@
 //       bool fragment(const Varying& in, Vec3& color) const;   // false = discard
 //   };
 //
+// or, to receive screen-space derivatives (for texture LOD, edge detection, ...):
+//
+//       bool fragment(const Varying& in, const Derivatives<Varying>& d, Vec3& color) const;
+//
 // Shaders are template parameters, so the whole pipeline is inlined per shader.
 #pragma once
 
 #include <algorithm>
+#include <concepts>
 #include <cstdint>
 #include <span>
 #include <thread>
@@ -33,6 +39,14 @@ struct DrawState {
     CullMode cull = CullMode::Back;
     bool depth_test = true;
     bool depth_write = true;
+};
+
+// Screen-space derivatives of a fragment's interpolated inputs, one pixel to the
+// right (ddx) and one pixel down (ddy). Shaders opt in with the 3-argument
+// fragment(in, derivatives, color) overload.
+template <class V>
+struct Derivatives {
+    V ddx, ddy;
 };
 
 struct RasterStats {
@@ -210,9 +224,17 @@ RasterStats draw(Framebuffer& fb, const Shader& shader, std::span<const VertexT>
     });
     for (auto& b : bins) stats.triangles_rasterized += b.size();
 
-    // 3. Rasterization. The screen is split into 8-row bands dealt round-robin to
-    //    threads, so every pixel is owned by exactly one thread: no locks, no races,
-    //    and triangle submission order is preserved within each pixel.
+    // 3. Rasterization in 2x2 pixel quads. The screen is split into 8-row bands
+    //    dealt round-robin to threads, so every pixel is owned by exactly one
+    //    thread: no locks, no races, and submission order is preserved per pixel.
+    //
+    //    Like a GPU, all four lanes of a quad are interpolated even when some fall
+    //    outside the triangle ("helper" lanes, extrapolated). Differences between
+    //    neighbouring lanes give each pixel the screen-space derivatives of its
+    //    inputs, which is what texture LOD selection needs.
+    constexpr bool kWantsDerivatives = requires(const Shader& s, const V& v, const Derivatives<V>& d, Vec3& c) {
+        { s.fragment(v, d, c) } -> std::convertible_to<bool>;
+    };
     const bool write_color = fb.has_color();
     parallel_for(workers, [&](unsigned t) {
         for (const auto& bin : bins) {
@@ -228,37 +250,82 @@ RasterStats draw(Framebuffer& fb, const Shader& shader, std::span<const VertexT>
                     bias[e] = is_top_left(tri.x[a], tri.y[a], tri.x[b], tri.y[b]) ? 0 : -1;
                 }
                 const float inv_area = 1.0f / float(tri.area);
+                const int qx0 = tri.min_x & ~1;
 
                 for (int band = first_band; band <= last_band; ++band) {
                     if (unsigned(band) % workers != t) continue;
-                    int y0 = std::max(tri.min_y, band * kBandHeight);
+                    // Bands start on even rows, so quads never straddle two threads.
+                    int y0 = std::max(tri.min_y, band * kBandHeight) & ~1;
                     int y1 = std::min(tri.max_y, band * kBandHeight + kBandHeight - 1);
-                    for (int y = y0; y <= y1; ++y) {
+                    for (int y = y0; y <= y1; y += 2) {
                         int64_t py = (int64_t(y) << kSubpixelBits) + kSubpixel / 2;
-                        int64_t px = (int64_t(tri.min_x) << kSubpixelBits) + kSubpixel / 2;
-                        int64_t w[3];
+                        int64_t px = (int64_t(qx0) << kSubpixelBits) + kSubpixel / 2;
+                        int64_t w[3];  // edge values at the quad's top-left pixel
                         for (int e = 0; e < 3; ++e) w[e] = A[e] * px + B[e] * py + C[e];
-                        for (int x = tri.min_x; x <= tri.max_x; ++x) {
-                            if (((w[0] + bias[0]) | (w[1] + bias[1]) | (w[2] + bias[2])) >= 0) {
-                                float l1 = float(w[1]) * inv_area, l2 = float(w[2]) * inv_area;
-                                float l0 = 1.0f - l1 - l2;
-                                float z = l0 * tri.z[0] + l1 * tri.z[1] + l2 * tri.z[2];
-                                float& depth = fb.depth_at(x, y);
-                                if (!state.depth_test || z < depth) {
-                                    if (!write_color) {
-                                        if (state.depth_write) depth = z;
-                                    } else {
-                                        float iw = l0 * tri.inv_w[0] + l1 * tri.inv_w[1] + l2 * tri.inv_w[2];
-                                        V in = (tri.var[0] * l0 + tri.var[1] * l1 + tri.var[2] * l2) * (1.0f / iw);
-                                        Vec3 color;
-                                        if (shader.fragment(in, color)) {
-                                            if (state.depth_write) depth = z;
-                                            fb.pixel(x, y) = pack_rgba(color);
-                                        }
-                                    }
+
+                        for (int x = qx0; x <= tri.max_x; x += 2) {
+                            // Lanes: 0 = (x, y), 1 = (x+1, y), 2 = (x, y+1), 3 = (x+1, y+1).
+                            int64_t lw[4][3];
+                            unsigned live = 0;
+                            for (int lane = 0; lane < 4; ++lane) {
+                                int dx = lane & 1, dy = lane >> 1;
+                                for (int e = 0; e < 3; ++e)
+                                    lw[lane][e] = w[e] + (A[e] << kSubpixelBits) * dx + (B[e] << kSubpixelBits) * dy;
+                                bool inside = ((lw[lane][0] + bias[0]) | (lw[lane][1] + bias[1]) |
+                                               (lw[lane][2] + bias[2])) >= 0;
+                                if (inside && x + dx < fb.width() && y + dy < fb.height()) live |= 1u << lane;
+                            }
+                            for (int e = 0; e < 3; ++e) w[e] += A[e] << (kSubpixelBits + 1);
+                            if (!live) continue;
+
+                            // Barycentrics and depth for all four lanes; early depth test on live ones.
+                            float l[4][3], z[4];
+                            for (int lane = 0; lane < 4; ++lane) {
+                                l[lane][1] = float(lw[lane][1]) * inv_area;
+                                l[lane][2] = float(lw[lane][2]) * inv_area;
+                                l[lane][0] = 1.0f - l[lane][1] - l[lane][2];
+                                z[lane] = l[lane][0] * tri.z[0] + l[lane][1] * tri.z[1] + l[lane][2] * tri.z[2];
+                                if ((live >> lane & 1) && state.depth_test &&
+                                    !(z[lane] < fb.depth_at(x + (lane & 1), y + (lane >> 1))))
+                                    live &= ~(1u << lane);
+                            }
+                            if (!live) continue;
+
+                            if (!write_color) {
+                                if (state.depth_write)
+                                    for (int lane = 0; lane < 4; ++lane)
+                                        if (live >> lane & 1) fb.depth_at(x + (lane & 1), y + (lane >> 1)) = z[lane];
+                                continue;
+                            }
+
+                            // Perspective-correct varyings. Helper lanes are only needed for derivatives.
+                            V in[4];
+                            for (int lane = 0; lane < 4; ++lane) {
+                                if (!kWantsDerivatives && !(live >> lane & 1)) continue;
+                                float iw = l[lane][0] * tri.inv_w[0] + l[lane][1] * tri.inv_w[1] +
+                                           l[lane][2] * tri.inv_w[2];
+                                iw = std::max(iw, 1e-8f);  // extrapolated helpers can approach w = 0
+                                in[lane] = (tri.var[0] * l[lane][0] + tri.var[1] * l[lane][1] +
+                                            tri.var[2] * l[lane][2]) * (1.0f / iw);
+                            }
+
+                            for (int lane = 0; lane < 4; ++lane) {
+                                if (!(live >> lane & 1)) continue;
+                                int dx = lane & 1, dy = lane >> 1;
+                                Vec3 color;
+                                bool keep;
+                                if constexpr (kWantsDerivatives) {
+                                    // "Fine" derivatives: differences along this lane's own row / column.
+                                    Derivatives<V> d{in[dy * 2 + 1] + in[dy * 2] * -1.0f, in[2 + dx] + in[dx] * -1.0f};
+                                    keep = shader.fragment(in[lane], d, color);
+                                } else {
+                                    keep = shader.fragment(in[lane], color);
+                                }
+                                if (keep) {
+                                    if (state.depth_write) fb.depth_at(x + dx, y + dy) = z[lane];
+                                    fb.pixel(x + dx, y + dy) = pack_rgba(color);
                                 }
                             }
-                            for (int e = 0; e < 3; ++e) w[e] += A[e] << kSubpixelBits;
                         }
                     }
                 }

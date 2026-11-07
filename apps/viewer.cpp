@@ -15,8 +15,8 @@ using namespace sr;
 static const char* kHelp =
     "controls:\n"
     "  left drag    orbit camera        wheel    zoom\n"
-    "  right drag   move the sun        1-4      shaded / normals / depth / uv\n"
-    "  W wireframe  S shadows  T textures  R spin model  L orbit sun\n"
+    "  right drag   move the sun        1-5      shaded / normals / depth / uv / mip levels\n"
+    "  W wireframe  S shadows  T textures  F texture filter  R spin model  L orbit sun\n"
     "  +/-          resolution scale    P        save screenshot.png\n"
     "  Esc          quit";
 
@@ -80,6 +80,10 @@ int main(int argc, char** argv) {
                         case SDLK_2: rs.mode = ViewMode::Normals; break;
                         case SDLK_3: rs.mode = ViewMode::Depth; break;
                         case SDLK_4: rs.mode = ViewMode::UV; break;
+                        case SDLK_5: rs.mode = ViewMode::Mips; break;
+                        case SDLK_F:
+                            rs.filter = TextureFilter((int(rs.filter) + 1) % int(TextureFilter::Count));
+                            break;
                         case SDLK_W: rs.wireframe = !rs.wireframe; break;
                         case SDLK_S: rs.shadows = !rs.shadows; break;
                         case SDLK_T: rs.textures = !rs.textures; break;
@@ -127,9 +131,10 @@ int main(int argc, char** argv) {
         if (++frames, double(now - title_timer) / double(SDL_GetPerformanceFrequency()) > 0.5) {
             char title[256];
             std::snprintf(title, sizeof title,
-                          "softrender | %s%s%s | %dx%d | %.0f fps | render %.1f ms | %zu tris",
+                          "softrender | %s%s%s | %s | %dx%d | %.0f fps | render %.1f ms | %zu tris",
                           view_mode_name(rs.mode), rs.wireframe ? " + wire" : "",
-                          rs.shadows && rs.mode == ViewMode::Shaded ? " + shadows" : "", fw, fh,
+                          rs.shadows && rs.mode == ViewMode::Shaded ? " + shadows" : "",
+                          texture_filter_name(rs.filter), fw, fh,
                           1000.0 * frames / frame_ms_accum, render_ms_accum / frames,
                           stats.model.triangles_in + stats.ground.triangles_in);
             SDL_SetWindowTitle(window, title);
