@@ -293,7 +293,9 @@ RasterStats draw(Framebuffer& fb, const Shader& shader, std::span<const VertexT>
     // Shaders that write display-referred colors (debug views) opt out of sRGB encoding.
     constexpr bool kDisplayOutput = requires { requires Shader::kOutputsDisplay; };
     const bool write_color = fb.has_color();
-    struct alignas(64) TileCounts {  // one cache line per thread: no false sharing
+    // Each thread counts into a local copy and stores it once at the end, so the
+    // shared array is never written concurrently and needs no cache-line padding.
+    struct TileCounts {
         size_t skipped = 0, full = 0, partial = 0;
     };
     std::vector<TileCounts> tile_counts(workers);
