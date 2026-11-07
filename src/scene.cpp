@@ -182,6 +182,15 @@ struct LitShader : SurfaceVertexShader {
     ShadowLookup shadow;
 
     bool fragment(const Surface& in, const Derivatives<Surface>& d, Vec3& out) const {
+        // Distance fog into the horizon color hides the edge of the ground plane.
+        // Fully fogged pixels skip lighting entirely: they are the distant floor
+        // near the horizon, which is also where anisotropic filtering is costliest.
+        float fog = smoothstep(10.0f, 26.0f, in.view_depth);
+        if (fog >= 1.0f) {
+            out = kSkyHorizon;
+            return true;
+        }
+
         Vec3 n = normalize(in.normal);
         Vec3 v = normalize(eye - in.world);
         if (dot(n, v) < 0) n = -n;  // shade back faces of open meshes sensibly
@@ -195,34 +204,28 @@ struct LitShader : SurfaceVertexShader {
         float spec = n_dot_l > 0 ? std::pow(std::max(dot(n, h), 0.0f), shininess) * specular : 0.0f;
         Vec3 ambient = lerp(Vec3(0.10f, 0.09f, 0.08f), Vec3(0.30f, 0.36f, 0.48f), n.y * 0.5f + 0.5f);
         Vec3 color = base * (ambient + sun_color * (n_dot_l * vis)) + sun_color * (spec * vis);
-
-        // Distance fog into the horizon color hides the edge of the ground plane.
-        float fog = smoothstep(10.0f, 26.0f, in.view_depth);
         out = lerp(aces_tonemap(color), kSkyHorizon, fog);
         return true;
     }
 };
 
-// Debug shaders output display-referred values; converting them to linear here
-// cancels the framebuffer's sRGB encode, so the stored byte equals the value.
-float srgb_to_linear(float s) {
-    s = clamp01(s);
-    return s <= 0.04045f ? s / 12.92f : std::pow((s + 0.055f) / 1.055f, 2.4f);
-}
-Vec3 display(Vec3 c) { return {srgb_to_linear(c.x), srgb_to_linear(c.y), srgb_to_linear(c.z)}; }
+// Debug shaders below write display-referred values (kOutputsDisplay), so the
+// visualized number lands in the framebuffer byte unchanged.
 
 struct NormalShader : SurfaceVertexShader {
+    static constexpr bool kOutputsDisplay = true;
     bool fragment(const Surface& in, Vec3& out) const {
-        out = display(normalize(in.normal) * 0.5f + Vec3(0.5f));
+        out = normalize(in.normal) * 0.5f + Vec3(0.5f);
         return true;
     }
 };
 
 struct DepthShader : SurfaceVertexShader {
+    static constexpr bool kOutputsDisplay = true;
     float near_vis = 0, far_vis = 1;
     bool fragment(const Surface& in, Vec3& out) const {
         float t = clamp01((in.view_depth - near_vis) / (far_vis - near_vis));
-        out = display(Vec3((1.0f - t) * (1.0f - t)));
+        out = Vec3((1.0f - t) * (1.0f - t));
         return true;
     }
 };
@@ -230,12 +233,13 @@ struct DepthShader : SurfaceVertexShader {
 // UV gradient with tile borders drawn as anti-aliased lines of constant 1.5 px
 // width, using derivatives the same way GLSL's fwidth() would.
 struct UVShader : SurfaceVertexShader {
+    static constexpr bool kOutputsDisplay = true;
     bool fragment(const Surface& in, const Derivatives<Surface>& d, Vec3& out) const {
         float u = fract(in.uv.x), v = fract(in.uv.y);
         float fu = std::abs(d.ddx.uv.x) + std::abs(d.ddy.uv.x), fv = std::abs(d.ddx.uv.y) + std::abs(d.ddy.uv.y);
         float du = std::min(u, 1.0f - u) / std::max(fu, 1e-6f), dv = std::min(v, 1.0f - v) / std::max(fv, 1e-6f);
         float line = 1.0f - 0.55f * (1.0f - smoothstep(0.0f, 1.5f, std::min(du, dv)));
-        out = display(Vec3(u, v, 0.25f) * line);
+        out = Vec3(u, v, 0.25f) * line;
         return true;
     }
 };
@@ -243,6 +247,7 @@ struct UVShader : SurfaceVertexShader {
 // Colors each pixel by the mip level trilinear filtering would pick:
 // blue = full resolution, then cyan, green, yellow, orange, red, magenta as it shrinks.
 struct MipShader : SurfaceVertexShader {
+    static constexpr bool kOutputsDisplay = true;
     const Texture* albedo = nullptr;
     bool fragment(const Surface& in, const Derivatives<Surface>& d, Vec3& out) const {
         static const Vec3 palette[] = {{0.15f, 0.35f, 1.0f}, {0.1f, 0.85f, 0.95f}, {0.2f, 0.9f, 0.3f},
@@ -254,7 +259,7 @@ struct MipShader : SurfaceVertexShader {
         Vec3 tint = lerp(palette[i], palette[i + 1], lod - float(i));
         Vec3 tex = albedo->sample(in.uv, d.ddx.uv, d.ddy.uv, TextureFilter::Trilinear);
         float lum = std::clamp(dot(tex, Vec3(0.3f, 0.6f, 0.1f)) * 2.0f, 0.0f, 1.0f);
-        out = display(tint * (0.55f + 0.45f * lum));
+        out = tint * (0.55f + 0.45f * lum);
         return true;
     }
 };
@@ -312,12 +317,15 @@ FrameStats Renderer::render(Framebuffer& fb, const Scene& scene, const OrbitCame
         constexpr bool kTextured = requires(decltype(shader)& s) { s.albedo; };
         shader.view = view;
         shader.view_proj = view_proj;
-        shader.model = ground;
-        if constexpr (kTextured) shader.albedo = &scene.ground_texture;
-        stats.ground = draw(fb, shader, ground_verts, ground_idx);
+        // Model first: it occludes part of the ground, so drawing it before the
+        // ground lets the early depth test reject hidden floor pixels before
+        // they run the (expensive, anisotropically filtered) fragment shader.
         shader.model = model;
         if constexpr (kTextured) shader.albedo = model_tex;
         stats.model = draw(fb, shader, model_verts, model_idx);
+        shader.model = ground;
+        if constexpr (kTextured) shader.albedo = &scene.ground_texture;
+        stats.ground = draw(fb, shader, ground_verts, ground_idx);
     };
     switch (rs.mode) {
         case ViewMode::Shaded: {

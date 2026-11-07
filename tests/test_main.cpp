@@ -185,16 +185,132 @@ static void test_mipmaps() {
     CHECK(std::abs(tri.x - 0.5f) < 1e-5f, "trilinear at the top level should be 0.5, got %f", tri.x);
 }
 
+// Exercises all three tile classifications and checks they agree with per-pixel coverage.
+static void test_tile_classification() {
+    const int W = 256, H = 256;
+    // A big triangle (many fully-inside tiles) and a thin diagonal sliver whose
+    // bounding box is mostly empty (many skipped tiles). Both have partial tiles.
+    std::vector<Vec2> verts = {{-0.9f, -0.9f}, {0.9f, -0.9f}, {-0.9f, 0.9f},
+                               {-0.95f, 0.95f}, {0.95f, -0.97f}, {0.97f, -0.95f}};
+    std::vector<uint32_t> big = {0, 1, 2}, sliver = {3, 4, 5};
+    for (const auto* idx : {&big, &sliver}) {
+        std::vector<std::atomic<int>> hits(size_t(W) * H);
+        Framebuffer fb(W, H);
+        CoverageShader shader{W, H, &hits};
+        RasterStats st = draw(fb, shader, std::span<const Vec2>(verts), std::span<const uint32_t>(*idx),
+                              {.cull = CullMode::None, .depth_test = false, .depth_write = false});
+        CHECK(st.tiles_partial > 0, "expected partial tiles");
+        if (idx == &big) CHECK(st.tiles_full > st.tiles_partial, "big triangle: %zu full vs %zu partial tiles", st.tiles_full, st.tiles_partial);
+        if (idx == &sliver) CHECK(st.tiles_skipped > st.tiles_partial, "sliver: %zu skipped vs %zu partial tiles", st.tiles_skipped, st.tiles_partial);
+
+        // Reference coverage: evaluate the same fixed-point edge test per pixel, without tiles.
+        int mismatches = 0;
+        int64_t X[3], Y[3];
+        for (int k = 0; k < 3; ++k) {
+            Vec2 v = verts[(*idx)[k]];
+            X[k] = std::llround((v.x * 0.5f + 0.5f) * W * 256);
+            Y[k] = std::llround((0.5f - v.y * 0.5f) * H * 256);
+        }
+        int64_t area = (X[1] - X[0]) * (Y[2] - Y[0]) - (Y[1] - Y[0]) * (X[2] - X[0]);
+        if (area < 0) { std::swap(X[1], X[2]); std::swap(Y[1], Y[2]); }
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x) {
+                int64_t px = int64_t(x) * 256 + 128, py = int64_t(y) * 256 + 128;
+                bool in = true;
+                for (int e = 0; e < 3; ++e) {
+                    int a = (e + 1) % 3, b = (e + 2) % 3;
+                    int64_t E = (X[b] - X[a]) * (py - Y[a]) - (Y[b] - Y[a]) * (px - X[a]);
+                    bool tl = (Y[b] == Y[a] && X[b] > X[a]) || Y[b] < Y[a];
+                    in &= tl ? E >= 0 : E > 0;
+                }
+                mismatches += in != (hits[size_t(y) * W + x] == 1);
+            }
+        CHECK(mismatches == 0, "%d pixels differ from the per-pixel reference", mismatches);
+    }
+}
+
+// Linear output is sRGB-encoded on write; display-referred output is stored as-is.
+template <bool Display>
+struct FlatShader {
+    static constexpr bool kOutputsDisplay = Display;
+    struct Varying {
+        Varying operator+(const Varying&) const { return {}; }
+        Varying operator*(float) const { return {}; }
+    };
+    Vec4 vertex(const Vec2& p, Varying&) const { return {p.x, p.y, 0.0f, 1.0f}; }
+    bool fragment(const Varying&, Vec3& color) const {
+        color = Vec3(0.5f);
+        return true;
+    }
+};
+
+static void test_output_encoding() {
+    std::vector<Vec2> verts = {{-1, -1}, {3, -1}, {-1, 3}};  // covers the whole screen
+    std::vector<uint32_t> idx = {0, 1, 2};
+    Framebuffer lin(8, 8), disp(8, 8);
+    draw(lin, FlatShader<false>{}, std::span<const Vec2>(verts), std::span<const uint32_t>(idx));
+    draw(disp, FlatShader<true>{}, std::span<const Vec2>(verts), std::span<const uint32_t>(idx));
+    CHECK((lin.pixel(3, 3) & 0xFF) == 188, "linear 0.5 should encode to sRGB 188, got %u", lin.pixel(3, 3) & 0xFF);
+    CHECK((disp.pixel(3, 3) & 0xFF) == 128, "display 0.5 should store 128, got %u", disp.pixel(3, 3) & 0xFF);
+}
+
+// Submission order must survive binning: with depth testing off, the last triangle
+// drawn wins every pixel, even though triangles are set up and binned by different threads.
+struct IdShader {
+    static constexpr bool kOutputsDisplay = true;
+    struct Varying {
+        float id;
+        Varying operator+(const Varying& o) const { return {id + o.id}; }
+        Varying operator*(float s) const { return {id * s}; }
+    };
+    struct In { Vec2 p; float id; };
+    Vec4 vertex(const In& v, Varying& out) const {
+        out.id = v.id;
+        return {v.p.x, v.p.y, 0.0f, 1.0f};
+    }
+    bool fragment(const Varying& in, Vec3& color) const {
+        color = Vec3(in.id);
+        return true;
+    }
+};
+
+static void test_submission_order() {
+    const int count = 5000;  // many identical full-screen triangles, spread over all setup threads
+    std::vector<IdShader::In> verts;
+    std::vector<uint32_t> idx;
+    for (int i = 0; i < count; ++i) {
+        float id = i == count - 1 ? 1.0f : 0.0f;
+        for (Vec2 p : {Vec2{-1, -1}, Vec2{3, -1}, Vec2{-1, 3}}) {
+            idx.push_back(uint32_t(verts.size()));
+            verts.push_back({p, id});
+        }
+    }
+    Framebuffer fb(97, 61);
+    draw(fb, IdShader{}, std::span<const IdShader::In>(verts), std::span<const uint32_t>(idx),
+         {.cull = CullMode::None, .depth_test = false, .depth_write = false});
+    int wrong = 0;
+    for (int y = 0; y < fb.height(); ++y)
+        for (int x = 0; x < fb.width(); ++x) wrong += (fb.pixel(x, y) & 0xFF) != 255;
+    CHECK(wrong == 0, "%d pixels not owned by the last-submitted triangle", wrong);
+}
+
 int main() {
     std::printf("watertight rasterization\n");
     test_watertight(64, 64, 8, 1);
     test_watertight(320, 240, 37, 2);
     test_watertight(1280, 720, 101, 3);
     test_watertight(97, 53, 13, 4);
+    test_watertight(1280, 720, 2, 5);  // huge triangles: mostly fully-covered tiles
+    std::printf("tile classification\n");
+    test_tile_classification();
+    std::printf("submission order\n");
+    test_submission_order();
     std::printf("backface culling\n");
     test_backface_culling();
     std::printf("quad derivatives\n");
     test_derivatives();
+    std::printf("output encoding\n");
+    test_output_encoding();
     std::printf("mipmaps\n");
     test_mipmaps();
     std::printf("OBJ loader\n");

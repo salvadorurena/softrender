@@ -112,6 +112,12 @@ int main(int argc, char** argv) {
         std::printf("  avg frame  %7.2f ms  (%.1f fps)\n", total / bench, 1000.0 * bench / total);
         std::printf("  shadow     %7.2f ms\n  main       %7.2f ms\n", shadow / bench, main / bench);
         if (rs.wireframe) std::printf("  wireframe  %7.2f ms\n", wire / bench);
+        size_t skipped = s.model.tiles_skipped + s.ground.tiles_skipped;
+        size_t full = s.model.tiles_full + s.ground.tiles_full;
+        size_t partial = s.model.tiles_partial + s.ground.tiles_partial;
+        double tiles = double(skipped + full + partial);
+        std::printf("  8x8 tiles (last frame): %.0f%% skipped, %.0f%% fully covered, %.0f%% partial\n",
+                    100.0 * skipped / tiles, 100.0 * full / tiles, 100.0 * partial / tiles);
         return 0;
     }
 

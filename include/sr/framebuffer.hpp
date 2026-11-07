@@ -13,39 +13,43 @@ namespace sr {
 
 namespace detail {
 // Linear [0,1] quantised to 12 bits -> 8-bit sRGB. Avoids a pow() per channel per pixel.
-inline const std::array<uint8_t, 4096>& linear_to_srgb_lut() {
-    static const auto lut = [] {
-        std::array<uint8_t, 4096> t{};
-        for (int i = 0; i < 4096; ++i) {
-            float c = i / 4095.0f;
-            float s = c <= 0.0031308f ? c * 12.92f : 1.055f * std::pow(c, 1.0f / 2.4f) - 0.055f;
-            t[i] = static_cast<uint8_t>(std::lround(clamp01(s) * 255.0f));
-        }
-        return t;
-    }();
-    return lut;
+inline std::array<uint8_t, 4096> make_linear_to_srgb() {
+    std::array<uint8_t, 4096> t{};
+    for (int i = 0; i < 4096; ++i) {
+        float c = i / 4095.0f;
+        float s = c <= 0.0031308f ? c * 12.92f : 1.055f * std::pow(c, 1.0f / 2.4f) - 0.055f;
+        t[i] = static_cast<uint8_t>(std::lround(clamp01(s) * 255.0f));
+    }
+    return t;
 }
-inline const std::array<float, 256>& srgb_to_linear_lut() {
-    static const auto lut = [] {
-        std::array<float, 256> t{};
-        for (int i = 0; i < 256; ++i) {
-            float s = i / 255.0f;
-            t[i] = s <= 0.04045f ? s / 12.92f : std::pow((s + 0.055f) / 1.055f, 2.4f);
-        }
-        return t;
-    }();
-    return lut;
+inline std::array<float, 256> make_srgb_to_linear() {
+    std::array<float, 256> t{};
+    for (int i = 0; i < 256; ++i) {
+        float s = i / 255.0f;
+        t[i] = s <= 0.04045f ? s / 12.92f : std::pow((s + 0.055f) / 1.055f, 2.4f);
+    }
+    return t;
 }
+// Namespace-scope tables are built once at startup. (A function-local static
+// would be lazily initialised, which costs a thread-safe guard check per lookup.)
+inline const std::array<uint8_t, 4096> kLinearToSrgb = make_linear_to_srgb();
+inline const std::array<float, 256> kSrgbToLinear = make_srgb_to_linear();
 }  // namespace detail
 
 inline uint8_t encode_srgb(float linear) {
-    return detail::linear_to_srgb_lut()[static_cast<int>(clamp01(linear) * 4095.0f + 0.5f)];
+    return detail::kLinearToSrgb[static_cast<int>(clamp01(linear) * 4095.0f + 0.5f)];
 }
-inline float decode_srgb(uint8_t s) { return detail::srgb_to_linear_lut()[s]; }
+inline float decode_srgb(uint8_t s) { return detail::kSrgbToLinear[s]; }
 
 inline uint32_t pack_rgba(Vec3 linear) {
     return uint32_t(encode_srgb(linear.x)) | uint32_t(encode_srgb(linear.y)) << 8 |
            uint32_t(encode_srgb(linear.z)) << 16 | 0xFF000000u;
+}
+// For values that are already display-referred (debug visualizations): plain
+// 8-bit quantization, no transfer function.
+inline uint32_t pack_rgba_display(Vec3 c) {
+    auto q = [](float v) { return uint32_t(clamp01(v) * 255.0f + 0.5f); };
+    return q(c.x) | q(c.y) << 8 | q(c.z) << 16 | 0xFF000000u;
 }
 inline Vec3 unpack_rgba(uint32_t p) {
     return {decode_srgb(p & 0xFF), decode_srgb((p >> 8) & 0xFF), decode_srgb((p >> 16) & 0xFF)};
