@@ -3,6 +3,7 @@
 #include <cmath>
 #include <cstdio>
 #include <fstream>
+#include <iterator>
 #include <random>
 #include <string>
 

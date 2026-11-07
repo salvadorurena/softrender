@@ -1,5 +1,7 @@
 # softrender
 
+[![CI](https://github.com/salvadorurena/softrender/actions/workflows/ci.yml/badge.svg)](https://github.com/salvadorurena/softrender/actions/workflows/ci.yml)
+
 A multithreaded software rasterizer written from scratch in C++20. It uses no GPU and no graphics API: every pixel below comes from my own triangle pipeline running on the CPU.
 
 ![Orbiting torus knot with dynamic shadows](docs/orbit.gif)
@@ -103,6 +105,8 @@ cmake -S . -B build
 cmake --build build -j
 ctest --test-dir build        # watertightness, culling, derivatives, mipmaps, OBJ and PNG
 ```
+
+CI builds and tests every push on Linux (GCC and Clang), macOS (Apple Clang, including the SDL3 viewer) and Windows (MSVC). Each job also renders a frame end to end and uploads it as a build artifact.
 
 ## Usage
 

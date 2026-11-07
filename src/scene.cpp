@@ -309,13 +309,14 @@ FrameStats Renderer::render(Framebuffer& fb, const Scene& scene, const OrbitCame
     t0 = std::chrono::steady_clock::now();
     clear_sky(fb, cam);
     auto draw_both = [&](auto shader, const Texture* model_tex) {
+        constexpr bool kTextured = requires(decltype(shader)& s) { s.albedo; };
         shader.view = view;
         shader.view_proj = view_proj;
         shader.model = ground;
-        if constexpr (requires { shader.albedo; }) shader.albedo = &scene.ground_texture;
+        if constexpr (kTextured) shader.albedo = &scene.ground_texture;
         stats.ground = draw(fb, shader, ground_verts, ground_idx);
         shader.model = model;
-        if constexpr (requires { shader.albedo; }) shader.albedo = model_tex;
+        if constexpr (kTextured) shader.albedo = model_tex;
         stats.model = draw(fb, shader, model_verts, model_idx);
     };
     switch (rs.mode) {

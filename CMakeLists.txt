@@ -51,3 +51,7 @@ add_executable(sr_tests tests/test_main.cpp)
 target_link_libraries(sr_tests PRIVATE sr)
 target_compile_definitions(sr_tests PRIVATE SR_TEST_TMP="${CMAKE_CURRENT_BINARY_DIR}")
 add_test(NAME sr_tests COMMAND sr_tests)
+# End-to-end: render the default scene to a PNG, and run a short benchmark.
+add_test(NAME render_smoke COMMAND softrender --size 640x360 --ssaa 2 --wireframe
+         --out ${CMAKE_CURRENT_BINARY_DIR}/smoke.png)
+add_test(NAME bench_smoke COMMAND softrender --bench 5 --size 320x180)

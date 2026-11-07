@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: "Linux · GCC", os: ubuntu-24.04, cxx: g++ }
+          - { name: "Linux · Clang", os: ubuntu-24.04, cxx: clang++ }
+          - { name: "macOS · Apple Clang + SDL3 viewer", os: macos-latest, sdl3: true }
+          - { name: "Windows · MSVC", os: windows-latest }
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install SDL3
+        if: matrix.sdl3
+        run: brew install sdl3
+
+      - name: Configure
+        run: >
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          ${{ matrix.cxx && format('-DCMAKE_CXX_COMPILER={0}', matrix.cxx) || '' }}
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure
+
+      - name: Upload smoke-test render
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: render-${{ matrix.os }}-${{ strategy.job-index }}
+          path: build/smoke.png
+          if-no-files-found: ignore
